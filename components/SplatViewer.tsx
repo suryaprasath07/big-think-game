@@ -2,17 +2,46 @@
 
 import { useEffect, useRef } from "react";
 import * as THREE from "three";
-import { createPlayer } from "@/hooks/usePlayer";
+import { createPlayer, createRemotePlayer } from "@/hooks/usePlayer";
 
-const SPLAT_URL    = "splats/model.spz";
+const SPLAT_URL    = "/splats/model.spz";
 const SPAWN_Y      = 0;
 const CAM_DISTANCE = 2;
 const CAM_HEIGHT   = 1.2;
 const MAX_FPS      = 30;
 const FRAME_MS     = 1000 / MAX_FPS;
 
-export default function SplatViewer() {
+interface Vec3 { x: number; y: number; z: number }
+interface RemotePlayer {
+  id: string;
+  name: string;
+  pos: Vec3;
+  rot: Vec3;
+  hp: number;
+  maxHp: number;
+  isDead: boolean;
+  anim: string;
+}
+
+interface SplatViewerProps {
+  remotePlayers?: Map<string, RemotePlayer>;
+  sendMove?: (payload: { seq: number; pos: Vec3; rot: Vec3; vel: Vec3; anim: string; t: number }) => void;
+  localHp?: number;
+  localMaxHp?: number;
+  localIsDead?: boolean;
+  requestRespawn?: () => void;
+}
+
+export default function SplatViewer({
+  remotePlayers = new Map(),
+  sendMove,
+  localHp = 100,
+  localMaxHp = 100,
+  localIsDead = false,
+  requestRespawn,
+}: SplatViewerProps) {
   const mountRef = useRef<HTMLDivElement>(null);
+  const remoteObjectsRef = useRef(new Map<string, ReturnType<typeof createRemotePlayer>>>();
 
   useEffect(() => {
     const container = mountRef.current;

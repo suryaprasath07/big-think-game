@@ -54,6 +54,8 @@ export const ARENAS: Arena[] = [
 export const ARENA_MAP = Object.fromEntries(ARENAS.map((a) => [a.id, a]));
 
 export const MAX_PLAYERS_OPTIONS = [2, 4, 6, 8, 12, 16];
-export const WS_URL = typeof window !== "undefined"
-  ? `ws://${window.location.host}/ws`
-  : "ws://localhost:3000/ws";
+
+export const WS_URL =
+  typeof window !== "undefined"
+    ? `ws://${window.location.hostname}:${process.env.NEXT_PUBLIC_WS_PORT ?? "3001"}`
+    : "ws://localhost:3001";

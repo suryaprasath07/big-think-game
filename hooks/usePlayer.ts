@@ -181,3 +181,146 @@ export function createPlayer(
 
   return { group, update, dispose, isLoaded: () => loaded };
 }
+
+// ── Create a remote player (no input, just display) ──────────────────────────
+export interface RemotePlayerController {
+  group:      THREE.Group;
+  setPosition: (pos: { x: number; y: number; z: number }) => void;
+  setRotation: (rot: { x: number; y: number; z: number }) => void;
+  setAnimation: (animName: string) => void;
+  dispose:    () => void;
+}
+
+export function createRemotePlayer(
+  scene: THREE.Scene,
+  playerId: string,
+  playerName: string
+): RemotePlayerController {
+  const group = new THREE.Group();
+  scene.add(group);
+
+  // Capsule placeholder (always visible while loading/if FBX fails)
+  const capsule = new THREE.Mesh(
+    new THREE.CapsuleGeometry(0.3, 1.2, 4, 8),
+    new THREE.MeshStandardMaterial({ 
+      color: new THREE.Color().setHSL(Math.random(), 0.8, 0.5) // random color per player
+    })
+  );
+  capsule.position.y = 0.9;
+  group.add(capsule);
+
+  // Name label
+  const canvas = document.createElement("canvas");
+  canvas.width = 256;
+  canvas.height = 64;
+  const ctx = canvas.getContext("2d")!;
+  ctx.fillStyle = "rgba(0, 0, 0, 0.7)";
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.fillStyle = "#fff";
+  ctx.font = "bold 32px Arial";
+  ctx.textAlign = "center";
+  ctx.fillText(playerName, canvas.width / 2, canvas.height / 2 + 10);
+
+  const texture = new THREE.CanvasTexture(canvas);
+  const labelMaterial = new THREE.MeshBasicMaterial({ map: texture, transparent: true });
+  const labelGeom = new THREE.PlaneGeometry(2, 0.5);
+  const labelMesh = new THREE.Mesh(labelGeom, labelMaterial);
+  labelMesh.position.y = 1.5;
+  labelMesh.renderOrder = 1;
+  group.add(labelMesh);
+
+  let mixer:         THREE.AnimationMixer | null = null;
+  const actions:     Record<string, THREE.AnimationAction> = {};
+  let currentAction: THREE.AnimationAction | null = null;
+  let fbxMesh:       THREE.Group | null = null;
+
+  const switchAnim = (name: string) => {
+    const next = actions[name];
+    if (!next || next === currentAction) return;
+    currentAction?.fadeOut(0.12);
+    next.reset().setEffectiveWeight(1).fadeIn(0.12).play();
+    currentAction = next;
+  };
+
+  // Load FBX in background (non-blocking)
+  const loader = new FBXLoader();
+  loader.load(
+    FBX_FILES.base,
+    (fbx) => {
+      const box  = new THREE.Box3().setFromObject(fbx);
+      const size = new THREE.Vector3();
+      box.getSize(size);
+      const scale = size.y > 0 ? 0.5 / size.y : CHARACTER_SCALE;
+      fbx.scale.setScalar(scale);
+
+      fbx.updateWorldMatrix(true, true);
+      const scaledBox = new THREE.Box3().setFromObject(fbx);
+      fbx.position.y -= scaledBox.min.y;
+
+      fbx.traverse((child) => {
+        const mesh = child as THREE.Mesh;
+        if (!mesh.isMesh) return;
+        mesh.castShadow    = false;
+        mesh.receiveShadow = false;
+      });
+
+      fbx.rotation.y = Math.PI;
+      group.add(fbx);
+      fbxMesh = fbx;
+      capsule.visible = false;
+
+      mixer = new THREE.AnimationMixer(fbx);
+      if (fbx.animations.length > 0) {
+        actions.idle = mixer.clipAction(fbx.animations[0]);
+        actions.idle.play();
+        currentAction = actions.idle;
+      }
+
+      // Load walk/run animations
+      const extras = Object.entries(FBX_FILES).filter(([k]) => k !== "base");
+      for (const [name, url] of extras) {
+        loader.load(
+          url,
+          (animFbx) => {
+            if (!animFbx.animations.length) return;
+            const clip = animFbx.animations[0];
+            clip.name  = name;
+            actions[name] = mixer!.clipAction(
+              THREE.AnimationClip.parse(THREE.AnimationClip.toJSON(clip)),
+              fbx
+            );
+          }
+        );
+      }
+    },
+    undefined,
+    (err) => console.error(`[RemotePlayer ${playerId}] FBX load failed:`, err)
+  );
+
+  return {
+    group,
+    setPosition: (pos: { x: number; y: number; z: number }) => {
+      group.position.set(pos.x, pos.y, pos.z);
+    },
+    setRotation: (rot: { x: number; y: number; z: number }) => {
+      group.rotation.order = "YXZ";
+      group.rotation.set(rot.x, rot.y, rot.z);
+    },
+    setAnimation: (animName: string) => {
+      mixer?.update(0.016); // Update mixer for smooth animation playback
+      if (animName && actions[animName]) {
+        switchAnim(animName);
+      }
+    },
+    dispose: () => {
+      scene.remove(group);
+      mixer?.stopAllAction();
+      capsule.geometry.dispose();
+      (capsule.material as THREE.Material).dispose();
+      labelGeom.dispose();
+      labelMaterial.dispose();
+      texture.dispose();
+      canvas.remove();
+    },
+  };
+}

@@ -3,17 +3,18 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "dev": "next dev",
+    "dev": "ts-node --project tsconfig.server.json server.ts",
     "build": "next build",
-    "start": "next start",
-    "lint": "eslint"
+    "start": "NODE_ENV=production ts-node --project tsconfig.server.json server.ts"
   },
   "dependencies": {
     "@sparkjsdev/spark": "^0.1.10",
     "next": "16.2.1",
     "react": "19.2.4",
     "react-dom": "19.2.4",
-    "three": "^0.183.2"
+    "three": "^0.183.2",
+    "ws": "^8.18.0",
+    "uuid": "^9.0.1"
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4",
@@ -21,9 +22,12 @@
     "@types/react": "^19",
     "@types/react-dom": "^19",
     "@types/three": "^0.183.1",
+    "@types/ws": "^8.5.12",
+    "@types/uuid": "^9.0.7",
     "eslint": "^9",
     "eslint-config-next": "16.2.1",
     "tailwindcss": "^4",
-    "typescript": "^5"
+    "typescript": "^5",
+    "ts-node": "^10.9.2"
   }
 }
