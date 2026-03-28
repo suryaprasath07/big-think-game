@@ -4,7 +4,7 @@ import { useEffect, useRef } from "react";
 import * as THREE from "three";
 import { createPlayer, createRemotePlayer } from "@/hooks/usePlayer";
 
-const SPLAT_URL    = "/splats/model.spz";
+const SPLAT_URL    = "/splats/model1.spz";
 const SPAWN_Y      = 0;
 const CAM_DISTANCE = 2;
 const CAM_HEIGHT   = 1.2;
@@ -13,14 +13,10 @@ const FRAME_MS     = 1000 / MAX_FPS;
 
 interface Vec3 { x: number; y: number; z: number }
 interface RemotePlayer {
-  id: string;
-  name: string;
-  pos: Vec3;
-  rot: Vec3;
-  hp: number;
-  maxHp: number;
-  isDead: boolean;
-  anim: string;
+  id: string; name: string;
+  pos: Vec3; rot: Vec3;
+  hp: number; maxHp: number;
+  isDead: boolean; anim: string;
 }
 
 interface SplatViewerProps {
@@ -41,7 +37,13 @@ export default function SplatViewer({
   requestRespawn,
 }: SplatViewerProps) {
   const mountRef = useRef<HTMLDivElement>(null);
-  const remoteObjectsRef = useRef(new Map<string, ReturnType<typeof createRemotePlayer>>>();
+
+  // ✅ Keep latest remotePlayers in a ref — animation loop reads this every frame
+  // This avoids the race condition where useEffect fires before the scene is ready
+  const remotePlayersRef = useRef<Map<string, RemotePlayer>>(new Map());
+  useEffect(() => {
+    remotePlayersRef.current = remotePlayers;
+  }, [remotePlayers]);
 
   useEffect(() => {
     const container = mountRef.current;
@@ -49,7 +51,6 @@ export default function SplatViewer({
     let cleanup: (() => void) | undefined;
 
     import("@sparkjsdev/spark").then(({ SplatMesh, SparkRenderer }) => {
-
       const isMobile = /Mobi|Android/i.test(navigator.userAgent);
       const renderer = new THREE.WebGLRenderer({
         antialias: false,
@@ -62,40 +63,26 @@ export default function SplatViewer({
       container.appendChild(renderer.domElement);
 
       const scene  = new THREE.Scene();
-      const camera = new THREE.PerspectiveCamera(
-        75,
-        container.clientWidth / container.clientHeight,
-        0.1,
-        500
-      );
+      const camera = new THREE.PerspectiveCamera(75, container.clientWidth / container.clientHeight, 0.1, 500);
 
       const spark = new SparkRenderer({ renderer });
       scene.add(spark);
-      scene.add(new SplatMesh({
-        url: SPLAT_URL,
-        maxSplats: isMobile ? 80_000 : 150_000,
-      }));
-
+      scene.add(new SplatMesh({ url: SPLAT_URL, maxSplats: isMobile ? 80_000 : 150_000 }));
       scene.add(new THREE.AmbientLight(0xffffff, 1.0));
       const sun = new THREE.DirectionalLight(0xffffff, 1.2);
       sun.position.set(5, 10, 5);
       scene.add(sun);
 
       const player = createPlayer(scene, SPAWN_Y);
-
-      // ── Attach camera to player group ──────────────────────────────────
-      // Player faces -Z. "Behind" in local space = +Z.
-      // Camera at +Z with no rotation naturally looks toward -Z (player's forward).
-      // YXZ order: parent group owns Y (yaw), camera owns X (pitch).
       camera.rotation.order = "YXZ";
-      camera.position.set(0, CAM_HEIGHT, CAM_DISTANCE);  // +Z = behind player ✓
-      // NO rotation.y flip — camera default look direction (-Z) is already correct
+      camera.position.set(0, CAM_HEIGHT, CAM_DISTANCE);
       player.group.add(camera);
 
+      // ✅ Remote player objects live here — keyed by playerId
+      const remoteObjects = new Map<string, ReturnType<typeof createRemotePlayer>>();
+
       const keys: Record<string, boolean> = {};
-      let yaw   = 0;
-      let pitch = 0.15;
-      let pointerLocked = false;
+      let yaw = 0, pitch = 0.15, pointerLocked = false;
 
       const onKeyDown = (e: KeyboardEvent) => { keys[e.code] = true; };
       const onKeyUp   = (e: KeyboardEvent) => { keys[e.code] = false; };
@@ -125,8 +112,9 @@ export default function SplatViewer({
       };
       window.addEventListener("resize", onResize);
 
-      let lastFrame = 0;
-      let lastTime  = performance.now();
+      let lastFrame = 0, lastTime = performance.now();
+      let seq = 0, lastSyncTime = 0;
+      const SYNC_INTERVAL = 50; // ms = 20hz
 
       renderer.setAnimationLoop((now: number) => {
         if (now - lastFrame < FRAME_MS) return;
@@ -135,6 +123,48 @@ export default function SplatViewer({
         lastTime = now;
 
         player.update(delta, yaw, keys);
+
+        // ── Send local position to server ──────────────────────────────────
+        if (sendMove && now - lastSyncTime >= SYNC_INTERVAL) {
+          lastSyncTime = now;
+          seq++;
+          const { x, y, z } = player.group.position;
+          const rot = player.group.rotation;
+          const moving  = keys["KeyW"] || keys["KeyS"] || keys["KeyA"] || keys["KeyD"];
+          const running = moving && (keys["ShiftLeft"] || keys["ShiftRight"]);
+          sendMove({
+            seq,
+            pos: { x, y, z },
+            rot: { x: rot.x, y: rot.y, z: rot.z },
+            vel: { x: 0, y: 0, z: 0 },
+            anim: running ? "run" : moving ? "walk" : "idle",
+            t: now,
+          });
+        }
+
+        // ── Sync remote players every frame from the ref ───────────────────
+        // This runs INSIDE the animation loop so the scene is guaranteed ready
+        const current = remotePlayersRef.current;
+
+        // Add / update
+        current.forEach((rp) => {
+          if (!remoteObjects.has(rp.id)) {
+            const obj = createRemotePlayer(scene, rp.id, rp.name);
+            remoteObjects.set(rp.id, obj);
+          }
+          const obj = remoteObjects.get(rp.id)!;
+          obj.setPosition(rp.pos);
+          obj.setRotation(rp.rot);
+          obj.setAnimation(rp.anim);
+        });
+
+        // Remove players who left
+        remoteObjects.forEach((obj, id) => {
+          if (!current.has(id)) {
+            obj.dispose();
+            remoteObjects.delete(id);
+          }
+        });
 
         spark.update?.(camera, renderer);
         renderer.render(scene, camera);
@@ -146,16 +176,16 @@ export default function SplatViewer({
         window.removeEventListener("keyup",    onKeyUp);
         window.removeEventListener("resize",   onResize);
         document.removeEventListener("mousemove", onMouseMove);
+        remoteObjects.forEach((obj) => obj.dispose());
+        remoteObjects.clear();
         player.dispose();
         renderer.dispose();
-        if (container.contains(renderer.domElement)) {
-          container.removeChild(renderer.domElement);
-        }
+        if (container.contains(renderer.domElement)) container.removeChild(renderer.domElement);
       };
     });
 
     return () => cleanup?.();
-  }, []);
+  }, []); // ✅ Empty deps — animation loop reads remotePlayersRef, not closure state
 
   return (
     <div style={{ position: "relative", width: "100%", height: "100%" }}>
@@ -166,7 +196,7 @@ export default function SplatViewer({
         padding: "8px 14px", borderRadius: 8,
         fontSize: 13, fontFamily: "monospace", pointerEvents: "none",
       }}>
-        🖱 Click to capture · WASD move · Shift run · Mouse look · Esc release
+        🖱 Click · WASD · Shift run · Mouse look · Esc
       </div>
     </div>
   );
