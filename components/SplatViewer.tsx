@@ -2,9 +2,11 @@
 
 import { useEffect, useRef } from "react";
 import * as THREE from "three";
-import { SplatMesh, SparkRenderer, SparkControls } from "@sparkjsdev/spark";
 
 const SPLAT_URL = "splats/model.spz";
+
+const TARGET_FPS = 30;
+const FRAME_MS = 1000 / TARGET_FPS;
 
 export default function SplatViewer() {
   const mountRef = useRef<HTMLDivElement>(null);
@@ -13,91 +15,83 @@ export default function SplatViewer() {
     const container = mountRef.current;
     if (!container) return;
 
-    // ── 1. Scene & Camera ─────────────────────────────────────────
-    const scene = new THREE.Scene();
+    let cleanup: (() => void) | undefined;
 
-    const camera = new THREE.PerspectiveCamera(
-      75,
-      container.clientWidth / container.clientHeight,
-      0.1,
-      1000
-    );
-    camera.position.set(0, 1, 4); // Start position inside the environment
+    // ✅ Dynamic import inside useEffect — the ONLY way to safely load WASM in Next.js
+    import("@sparkjsdev/spark").then(({ SplatMesh, SparkRenderer, SparkControls }) => {
+      const scene = new THREE.Scene();
 
-    // ── 2. Renderer ────────────────────────────────────────────────
-    const renderer = new THREE.WebGLRenderer({ antialias: false });
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1));
-    renderer.setSize(container.clientWidth, container.clientHeight);
-    container.appendChild(renderer.domElement);
+      const camera = new THREE.PerspectiveCamera(
+        75,
+        container.clientWidth / container.clientHeight,
+        0.1,
+        1000
+      );
+      camera.position.set(0, 1, 4);
 
-    // ── 3. Spark – manages splat sorting & rendering ───────────────
-    const spark = new SparkRenderer({ renderer });
-    scene.add(spark);
+      const isMobile = /Mobi|Android/i.test(navigator.userAgent);
 
-    // ── 4. Load the Gaussian Splat environment ─────────────────────
-    const splatMesh = new SplatMesh({ url: SPLAT_URL });
-    splatMesh.position.set(0, 0, 0);
-    scene.add(splatMesh);
+      const renderer = new THREE.WebGLRenderer({ antialias: false });
+      renderer.setPixelRatio(isMobile ? 0.75 : Math.min(window.devicePixelRatio, 1));
+      renderer.setSize(container.clientWidth, container.clientHeight);
+      container.appendChild(renderer.domElement);
 
-    // ── 5. SparkControls – FPS navigation (WASD + mouse) ──────────
-    //       Click the canvas to lock the pointer, then:
-    //       W/A/S/D  – move,  Mouse – look around
-    //       Shift    – speed boost,  Ctrl – slow down
-    const controls = new SparkControls({ canvas: renderer.domElement });
+      const spark = new SparkRenderer({ renderer });
+      scene.add(spark);
 
-    // ── 6. Resize handler ──────────────────────────────────────────
-    const onResize = () => {
-      const w = container.clientWidth;
-      const h = container.clientHeight;
-      camera.aspect = w / h;
-      camera.updateProjectionMatrix();
-      renderer.setSize(w, h);
-    };
-    window.addEventListener("resize", onResize);
+      const splatMesh = new SplatMesh({
+        url: SPLAT_URL,
+        maxSplats: isMobile ? 200_000 : 500_000,
+      });
+      scene.add(splatMesh);
 
-    // ── 7. Render loop ─────────────────────────────────────────────
-    let lastTime = performance.now();
+      const controls = new SparkControls({ canvas: renderer.domElement });
 
-    renderer.setAnimationLoop(() => {
-      const now = performance.now();
-      const delta = (now - lastTime) / 1000; // seconds
-      lastTime = now;
+      const onResize = (): void => {
+        const w = container.clientWidth;
+        const h = container.clientHeight;
+        camera.aspect = w / h;
+        camera.updateProjectionMatrix();
+        renderer.setSize(w, h);
+      };
+      window.addEventListener("resize", onResize);
 
-      controls.update(camera, delta); // Move camera with input
-      renderer.render(scene, camera);
+      let lastFrame = 0;
+      let lastTime = performance.now();
+
+      renderer.setAnimationLoop((now: number) => {
+        if (now - lastFrame < FRAME_MS) return;
+        lastFrame = now;
+        const delta = (now - lastTime) / 1000;
+        lastTime = now;
+        controls.update(camera);
+        renderer.render(scene, camera);
+      });
+
+      cleanup = (): void => {
+        renderer.setAnimationLoop(null);
+        window.removeEventListener("resize", onResize);
+        // controls.dispose();
+        renderer.dispose();
+        if (container.contains(renderer.domElement)) {
+          container.removeChild(renderer.domElement);
+        }
+      };
     });
 
-    // ── Cleanup on unmount ─────────────────────────────────────────
-    return () => {
-      renderer.setAnimationLoop(null);
-      window.removeEventListener("resize", onResize);
-      renderer.dispose();
-      container.removeChild(renderer.domElement);
-    };
+    return () => cleanup?.();
   }, []);
 
   return (
     <div style={{ position: "relative", width: "100%", height: "100%" }}>
-      {/* Three.js canvas mounts here */}
       <div ref={mountRef} style={{ width: "100%", height: "100%" }} />
-
-      {/* HUD overlay */}
-      <div
-        style={{
-          position: "absolute",
-          bottom: 16,
-          left: 16,
-          color: "white",
-          background: "rgba(0,0,0,0.5)",
-          padding: "8px 14px",
-          borderRadius: 8,
-          fontSize: 13,
-          fontFamily: "monospace",
-          pointerEvents: "none",
-        }}
-      >
-        🖱 Click to capture mouse &nbsp;|&nbsp; WASD move &nbsp;|&nbsp; Mouse
-        look &nbsp;|&nbsp; Shift = fast &nbsp;|&nbsp; Esc = release
+      <div style={{
+        position: "absolute", bottom: 16, left: 16,
+        color: "white", background: "rgba(0,0,0,0.55)",
+        padding: "8px 14px", borderRadius: 8,
+        fontSize: 13, fontFamily: "monospace", pointerEvents: "none",
+      }}>
+        🖱 Click to capture · WASD move · Mouse look · Shift fast · Esc release
       </div>
     </div>
   );
