@@ -86,6 +86,41 @@ function KillFeed({ entries }: {
   );
 }
 
+// ─── Scoreboard ───────────────────────────────────────────────────────────────
+
+function Scoreboard({ scores, players }: {
+  scores: Record<string, number>;
+  players: Array<{ id: string; name: string }>;
+}) {
+  const sorted = [...players].sort((a, b) => (scores[b.id] ?? 0) - (scores[a.id] ?? 0));
+  return (
+    <div style={{
+      background: "rgba(0,0,0,0.6)", backdropFilter: "blur(8px)",
+      borderRadius: 10, padding: "10px 14px", minWidth: 180,
+      display: "flex", flexDirection: "column", gap: 6,
+    }}>
+      <span style={{ fontSize: 11, color: "#64748b", fontFamily: "monospace", letterSpacing: 1 }}>
+        SCOREBOARD
+      </span>
+      {sorted.map((p, i) => (
+        <div key={p.id} style={{
+          display: "flex", justifyContent: "space-between", alignItems: "center",
+          fontSize: 13, fontFamily: "monospace",
+        }}>
+          <span style={{ color: i === 0 ? "#facc15" : "#e2e8f0" }}>
+            {i === 0 ? "👑 " : ""}{p.name}
+          </span>
+          <span style={{
+            marginLeft: 16, color: "#4ade80", fontWeight: 700, minWidth: 20, textAlign: "right",
+          }}>
+            {scores[p.id] ?? 0}
+          </span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 // ─── Chat Overlay ─────────────────────────────────────────────────────────────
 
 function ChatOverlay({ log, onSend }: {
@@ -223,12 +258,14 @@ export default function GameRoomPage() {
     startGame,
     remotePlayers,
     sendMove,
+    sendAttack,
     localHp,
     localMaxHp,
     localIsDead,
     requestRespawn,
     chatLog,
     killFeed,
+    scores,
     sendChat,
   } = useLobby();
 
@@ -296,8 +333,12 @@ export default function GameRoomPage() {
           </div>
         </div>
 
-        {/* Top-right: kill feed */}
-        <div style={{ position: "absolute", top: 16, right: 16, zIndex: 10 }}>
+        {/* Top-right: scoreboard + kill feed */}
+        <div style={{
+          position: "absolute", top: 16, right: 16, zIndex: 10,
+          display: "flex", flexDirection: "column", gap: 10, alignItems: "flex-end",
+        }}>
+          <Scoreboard scores={scores} players={currentRoom.players} />
           <KillFeed entries={killFeed} />
         </div>
 
@@ -327,6 +368,7 @@ export default function GameRoomPage() {
         <SplatViewer
           remotePlayers={remotePlayers}
           sendMove={sendMove}
+          sendAttack={sendAttack}   // ← added
           localHp={localHp}
           localMaxHp={localMaxHp}
           localIsDead={localIsDead}

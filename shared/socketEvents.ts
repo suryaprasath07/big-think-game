@@ -53,6 +53,7 @@ export const S = {
   // Chat / emotes
   PLAYER_EMOTE:   "player_emote",   // playerId, emoteId
   CHAT_MESSAGE:   "chat_message",   // playerId, playerName, text, timestamp
+  SCORE_UPDATE: "score_update",
 } as const;
 
 // ─── Payload types ─────────────────────────────────────────────────────────────

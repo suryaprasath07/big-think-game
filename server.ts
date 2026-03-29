@@ -50,6 +50,7 @@ interface Room {
   createdAt: number;
   // game state (only meaningful when status === "playing")
   gameState: Map<string, GamePlayer>;
+  scores:    Map<string, number>; // ← new
   tick: number;
 }
 
@@ -123,6 +124,7 @@ function buildGameSnapshot(room: Room) {
       isDead: gp.isDead,
       anim: gp.anim,
     })),
+    scores: Object.fromEntries(room.scores), // ← include scores
   };
 }
 
@@ -196,7 +198,7 @@ app.prepare().then(() => {
 
         switch (event) {
 
-          // ── Lobby events (unchanged) ───────────────────────────────────────
+          // ── Lobby events ────────────────────────────────────────────────
 
           case "set_name": {
             if (typeof data?.name === "string") {
@@ -212,10 +214,7 @@ app.prepare().then(() => {
             break;
           }
 
-          case "get_room_list": {
-            send(ws, "room_list", getRoomList());
-            break;
-          }
+          case "get_room_list": { send(ws, "room_list", getRoomList()); break; }
 
           case "create_room": {
             if (player.roomId) { send(ws, "error", { message: "Already in a room." }); break; }
@@ -229,6 +228,7 @@ app.prepare().then(() => {
               maxPlayers: Math.min(Math.max(data?.maxPlayers ?? 8, 2), 16),
               createdAt: Date.now(),
               gameState: new Map(),
+              scores: new Map(), // ← initialize scores
               tick: 0,
             };
             rooms.set(room.id, room);
@@ -252,12 +252,7 @@ app.prepare().then(() => {
             break;
           }
 
-          case "leave_room": {
-            if (!player.roomId) break;
-            handleLeave(player);
-            send(ws, "room_left", {});
-            break;
-          }
+          case "leave_room": { if (!player.roomId) break; handleLeave(player); send(ws, "room_left", {}); break; }
 
           case "select_arena": {
             if (!player.roomId) break;
@@ -276,21 +271,28 @@ app.prepare().then(() => {
             if (!room || room.hostId !== playerId) break;
             if (!room.arena) { send(ws, "error", { message: "Select an arena first." }); break; }
             room.status = "playing";
-            // Initialise game state for every player in the room
+
+            // Initialise game state
             room.players.forEach((p) => {
               room.gameState.set(p.id, initGamePlayer(p.id));
             });
+
+            // Reset scores
+            room.scores.clear();
+            room.players.forEach((p) => room.scores.set(p.id, 0));
+
             const snap = roomSnapshot(room);
             broadcast(room, "game_started", { roomId: room.id, arenaId: room.arena, room: snap });
             send(ws, "game_started", { roomId: room.id, arenaId: room.arena, room: snap });
-            // Send initial snapshot to everyone
+
+            // Send initial snapshot
             const gs = buildGameSnapshot(room);
             room.players.forEach((p) => send(p.ws, "game_state_snapshot", gs));
             broadcastAll("room_list", getRoomList());
             break;
           }
 
-          // ── Game events ────────────────────────────────────────────────────
+          // ── Game events ────────────────────────────────────────────────
 
           case "player_move": {
             if (!player.roomId) break;
@@ -300,17 +302,15 @@ app.prepare().then(() => {
             if (!gp || gp.isDead) break;
 
             const now = Date.now();
-            if (now - gp.lastMoveAt < MOVE_THROTTLE) break; // throttle to 20hz
+            if (now - gp.lastMoveAt < MOVE_THROTTLE) break;
             gp.lastMoveAt = now;
 
-            // Update authoritative position
             if (data?.pos) gp.pos = data.pos;
             if (data?.rot) gp.rot = data.rot;
             if (data?.vel) gp.vel = data.vel;
             if (data?.anim) gp.anim = data.anim;
             room.tick++;
 
-            // Relay to everyone else in the room
             broadcast(room, "player_state", {
               playerId,
               seq:  data?.seq ?? 0,
@@ -335,16 +335,14 @@ app.prepare().then(() => {
             const target   = room.gameState.get(targetId);
             if (!target || target.isDead) break;
 
-            // Sanity-check: attacker must be within reasonable range
             const dx = attacker.pos.x - target.pos.x;
             const dz = attacker.pos.z - target.pos.z;
-            const dist = Math.sqrt(dx * dx + dz * dz);
-            if (dist > 8) break; // too far, ignore
+            const dist = Math.sqrt(dx*dx + dz*dz);
+            if (dist > 8) break;
 
             const rawDamage = Math.min(Math.max(Number(data?.damage) || 10, 1), 50);
             target.hp = Math.max(0, target.hp - rawDamage);
 
-            // Broadcast health update to the whole room
             const healthPayload = {
               playerId:   targetId,
               hp:         target.hp,
@@ -355,20 +353,23 @@ app.prepare().then(() => {
             broadcast(room, "health_update", healthPayload);
             send(ws, "health_update", healthPayload);
 
-            // Handle death
+            // ── Handle death & update scores ──────────────────────────────
             if (target.hp <= 0 && !target.isDead) {
               target.isDead = true;
               target.anim   = "dead";
 
-              const diedPayload = {
-                playerId:   targetId,
-                killerId:   playerId,
-                respawnIn:  RESPAWN_MS,
-              };
+              // Increment killer's score
+              const killerScore = (room.scores.get(playerId) ?? 0) + 1;
+              room.scores.set(playerId, killerScore);
+
+              const scorePayload = { scores: Object.fromEntries(room.scores) };
+              broadcast(room, "score_update", scorePayload);
+              send(ws, "score_update", scorePayload);
+
+              const diedPayload = { playerId: targetId, killerId: playerId, respawnIn: RESPAWN_MS };
               broadcast(room, "player_died", diedPayload);
               send(ws, "player_died", diedPayload);
 
-              // Auto-respawn after RESPAWN_MS
               setTimeout(() => {
                 const r = rooms.get(room.id);
                 if (!r) return;
@@ -395,7 +396,6 @@ app.prepare().then(() => {
           }
 
           case "player_respawn_request": {
-            // Manual early respawn — honour only if player is dead
             if (!player.roomId) break;
             const room = rooms.get(player.roomId);
             if (!room || room.status !== "playing") break;

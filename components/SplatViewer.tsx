@@ -4,12 +4,15 @@ import { useEffect, useRef } from "react";
 import * as THREE from "three";
 import { createPlayer, createRemotePlayer } from "@/hooks/usePlayer";
 
-const SPLAT_URL    = "/splats/model1.spz";
+const SPLAT_URL    = "/splats/model.spz";
 const SPAWN_Y      = 0;
 const CAM_DISTANCE = 2;
 const CAM_HEIGHT   = 1.2;
 const MAX_FPS      = 30;
 const FRAME_MS     = 1000 / MAX_FPS;
+const PUNCH_DAMAGE = 25;
+const PUNCH_RANGE  = 1.8;
+const PUNCH_ARC    = 0.3; // dot product threshold (~72° cone)
 
 interface Vec3 { x: number; y: number; z: number }
 interface RemotePlayer {
@@ -20,30 +23,28 @@ interface RemotePlayer {
 }
 
 interface SplatViewerProps {
-  remotePlayers?: Map<string, RemotePlayer>;
-  sendMove?: (payload: { seq: number; pos: Vec3; rot: Vec3; vel: Vec3; anim: string; t: number }) => void;
-  localHp?: number;
-  localMaxHp?: number;
-  localIsDead?: boolean;
+  remotePlayers?:  Map<string, RemotePlayer>;
+  sendMove?:       (p: { seq: number; pos: Vec3; rot: Vec3; vel: Vec3; anim: string; t: number }) => void;
+  sendAttack?:     (targetId: string, damage: number, weaponId?: string) => void;
+  localHp?:        number;
+  localMaxHp?:     number;
+  localIsDead?:    boolean;
   requestRespawn?: () => void;
 }
 
 export default function SplatViewer({
   remotePlayers = new Map(),
   sendMove,
-  localHp = 100,
-  localMaxHp = 100,
-  localIsDead = false,
+  sendAttack,
+  localHp       = 100,
+  localMaxHp    = 100,
+  localIsDead   = false,
   requestRespawn,
 }: SplatViewerProps) {
-  const mountRef = useRef<HTMLDivElement>(null);
-
-  // ✅ Keep latest remotePlayers in a ref — animation loop reads this every frame
-  // This avoids the race condition where useEffect fires before the scene is ready
+  const mountRef         = useRef<HTMLDivElement>(null);
   const remotePlayersRef = useRef<Map<string, RemotePlayer>>(new Map());
-  useEffect(() => {
-    remotePlayersRef.current = remotePlayers;
-  }, [remotePlayers]);
+
+  useEffect(() => { remotePlayersRef.current = remotePlayers; }, [remotePlayers]);
 
   useEffect(() => {
     const container = mountRef.current;
@@ -52,10 +53,7 @@ export default function SplatViewer({
 
     import("@sparkjsdev/spark").then(({ SplatMesh, SparkRenderer }) => {
       const isMobile = /Mobi|Android/i.test(navigator.userAgent);
-      const renderer = new THREE.WebGLRenderer({
-        antialias: false,
-        powerPreference: "high-performance",
-      });
+      const renderer = new THREE.WebGLRenderer({ antialias: false, powerPreference: "high-performance" });
       renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.0));
       renderer.setSize(container.clientWidth, container.clientHeight);
       renderer.shadowMap.enabled = false;
@@ -78,12 +76,12 @@ export default function SplatViewer({
       camera.position.set(0, CAM_HEIGHT, CAM_DISTANCE);
       player.group.add(camera);
 
-      // ✅ Remote player objects live here — keyed by playerId
       const remoteObjects = new Map<string, ReturnType<typeof createRemotePlayer>>();
 
       const keys: Record<string, boolean> = {};
       let yaw = 0, pitch = 0.15, pointerLocked = false;
 
+      // ── Input ────────────────────────────────────────────────────────────
       const onKeyDown = (e: KeyboardEvent) => { keys[e.code] = true; };
       const onKeyUp   = (e: KeyboardEvent) => { keys[e.code] = false; };
       window.addEventListener("keydown", onKeyDown);
@@ -105,6 +103,31 @@ export default function SplatViewer({
       };
       document.addEventListener("mousemove", onMouseMove);
 
+      // ── Punch on left-click while locked ─────────────────────────────────
+      const onMouseDown = (e: MouseEvent) => {
+        if (!pointerLocked || e.button !== 0) return;
+
+        player.punch((worldPos, forward) => {
+          if (!sendAttack) return;
+
+          const current = remotePlayersRef.current;
+          current.forEach((rp, id) => {
+            if (rp.isDead) return;
+            const rpPos = new THREE.Vector3(rp.pos.x, rp.pos.y, rp.pos.z);
+            const dist  = worldPos.distanceTo(rpPos);
+            if (dist > PUNCH_RANGE) return;
+
+            // Must be in forward arc
+            const toTarget = rpPos.clone().sub(worldPos).normalize();
+            const dot = forward.dot(toTarget);
+            if (dot < PUNCH_ARC) return;
+
+            sendAttack(id, PUNCH_DAMAGE, "punch");
+          });
+        });
+      };
+      document.addEventListener("mousedown", onMouseDown);
+
       const onResize = () => {
         camera.aspect = container.clientWidth / container.clientHeight;
         camera.updateProjectionMatrix();
@@ -114,7 +137,7 @@ export default function SplatViewer({
 
       let lastFrame = 0, lastTime = performance.now();
       let seq = 0, lastSyncTime = 0;
-      const SYNC_INTERVAL = 50; // ms = 20hz
+      const SYNC_INTERVAL = 50; // 20hz
 
       renderer.setAnimationLoop((now: number) => {
         if (now - lastFrame < FRAME_MS) return;
@@ -124,12 +147,12 @@ export default function SplatViewer({
 
         player.update(delta, yaw, keys);
 
-        // ── Send local position to server ──────────────────────────────────
+        // ── Send position ─────────────────────────────────────────────────
         if (sendMove && now - lastSyncTime >= SYNC_INTERVAL) {
           lastSyncTime = now;
           seq++;
           const { x, y, z } = player.group.position;
-          const rot = player.group.rotation;
+          const rot     = player.group.rotation;
           const moving  = keys["KeyW"] || keys["KeyS"] || keys["KeyA"] || keys["KeyD"];
           const running = moving && (keys["ShiftLeft"] || keys["ShiftRight"]);
           sendMove({
@@ -142,28 +165,19 @@ export default function SplatViewer({
           });
         }
 
-        // ── Sync remote players every frame from the ref ───────────────────
-        // This runs INSIDE the animation loop so the scene is guaranteed ready
+        // ── Sync remote players ───────────────────────────────────────────
         const current = remotePlayersRef.current;
-
-        // Add / update
         current.forEach((rp) => {
           if (!remoteObjects.has(rp.id)) {
-            const obj = createRemotePlayer(scene, rp.id, rp.name);
-            remoteObjects.set(rp.id, obj);
+            remoteObjects.set(rp.id, createRemotePlayer(scene, rp.id, rp.name));
           }
           const obj = remoteObjects.get(rp.id)!;
           obj.setPosition(rp.pos);
           obj.setRotation(rp.rot);
-          obj.setAnimation(rp.anim);
+          obj.setAnimation(rp.anim, delta);
         });
-
-        // Remove players who left
         remoteObjects.forEach((obj, id) => {
-          if (!current.has(id)) {
-            obj.dispose();
-            remoteObjects.delete(id);
-          }
+          if (!current.has(id)) { obj.dispose(); remoteObjects.delete(id); }
         });
 
         spark.update?.(camera, renderer);
@@ -172,10 +186,11 @@ export default function SplatViewer({
 
       cleanup = () => {
         renderer.setAnimationLoop(null);
-        window.removeEventListener("keydown",  onKeyDown);
-        window.removeEventListener("keyup",    onKeyUp);
-        window.removeEventListener("resize",   onResize);
-        document.removeEventListener("mousemove", onMouseMove);
+        window.removeEventListener("keydown",    onKeyDown);
+        window.removeEventListener("keyup",      onKeyUp);
+        window.removeEventListener("resize",     onResize);
+        document.removeEventListener("mousemove",  onMouseMove);
+        document.removeEventListener("mousedown",  onMouseDown);
         remoteObjects.forEach((obj) => obj.dispose());
         remoteObjects.clear();
         player.dispose();
@@ -185,7 +200,7 @@ export default function SplatViewer({
     });
 
     return () => cleanup?.();
-  }, []); // ✅ Empty deps — animation loop reads remotePlayersRef, not closure state
+  }, []);
 
   return (
     <div style={{ position: "relative", width: "100%", height: "100%" }}>
@@ -196,7 +211,7 @@ export default function SplatViewer({
         padding: "8px 14px", borderRadius: 8,
         fontSize: 13, fontFamily: "monospace", pointerEvents: "none",
       }}>
-        🖱 Click · WASD · Shift run · Mouse look · Esc
+        🖱 Click · WASD · Shift run · Mouse look · LMB punch · Esc
       </div>
     </div>
   );

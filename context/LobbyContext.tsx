@@ -37,6 +37,7 @@ export interface RemotePlayer {
 export interface GameSnapshot {
   tick: number;
   players: RemotePlayer[];
+  scores?: Record<string, number>;
 }
 
 export interface ChatEntry {
@@ -51,29 +52,30 @@ export interface ChatEntry {
 interface LobbyContextValue extends LobbyState {
   isHost: boolean;
 
-  // Game state (populated once game starts)
+  // Game state
   remotePlayers:  Map<string, RemotePlayer>;
   localHp:        number;
   localMaxHp:     number;
   localIsDead:    boolean;
   chatLog:        ChatEntry[];
   killFeed:       Array<{ killerId: string; killerName: string; victimId: string; victimName: string; ts: number }>;
+  scores:         Record<string, number>;
 
   // Lobby actions
-  send:         (event: string, data?: unknown) => void;
-  setName:      (name: string) => void;
-  refreshRooms: () => void;
-  createRoom:   (name: string, maxPlayers?: number) => void;
-  joinRoom:     (roomId: string) => void;
-  leaveRoom:    () => void;
-  selectArena:  (arenaId: string) => void;
-  startGame:    () => void;
+  send:           (event: string, data?: unknown) => void;
+  setName:        (name: string) => void;
+  refreshRooms:   () => void;
+  createRoom:     (name: string, maxPlayers?: number) => void;
+  joinRoom:       (roomId: string) => void;
+  leaveRoom:      () => void;
+  selectArena:    (arenaId: string) => void;
+  startGame:      () => void;
 
   // Game actions
-  sendMove:     (payload: { seq: number; pos: Vec3; rot: Vec3; vel: Vec3; anim: string; t: number }) => void;
-  sendAttack:   (targetId: string, damage: number, weaponId?: string) => void;
-  sendEmote:    (emoteId: string) => void;
-  sendChat:     (text: string) => void;
+  sendMove:       (payload: { seq: number; pos: Vec3; rot: Vec3; vel: Vec3; anim: string; t: number }) => void;
+  sendAttack:     (targetId: string, damage: number, weaponId?: string) => void;
+  sendEmote:      (emoteId: string) => void;
+  sendChat:       (text: string) => void;
   requestRespawn: () => void;
 }
 
@@ -84,11 +86,14 @@ const LobbyContext = createContext<LobbyContextValue | null>(null);
 export function LobbyProvider({ children }: { children: ReactNode }) {
   const router = useRouter();
 
-  const ws          = useRef<WebSocket | null>(null);
-  const queue       = useRef<string[]>([]);
-  const reconnectTO = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const mounted     = useRef(true);
-  const playerIdRef = useRef<string | null>(null);
+  const ws             = useRef<WebSocket | null>(null);
+  const queue          = useRef<string[]>([]);
+  const reconnectTO    = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const mounted        = useRef(true);
+  const playerIdRef    = useRef<string | null>(null);
+
+  // Stable ref so connect() never re-runs just because handleMessage changed.
+  const handleMessageRef = useRef<(raw: string) => void>(() => {});
 
   const [state, setState] = useState<LobbyState>({
     playerId:         null,
@@ -99,22 +104,21 @@ export function LobbyProvider({ children }: { children: ReactNode }) {
     error:            null,
   });
 
-  // ── Game state (mutable refs for high-freq updates, React state for UI) ───
   const [remotePlayers, setRemotePlayers] = useState<Map<string, RemotePlayer>>(new Map());
   const [localHp,       setLocalHp]       = useState(100);
   const [localMaxHp,    setLocalMaxHp]    = useState(100);
   const [localIsDead,   setLocalIsDead]   = useState(false);
   const [chatLog,       setChatLog]       = useState<ChatEntry[]>([]);
-  const [killFeed,      setKillFeed]      = useState<Array<{
-    killerId: string; killerName: string; victimId: string; victimName: string; ts: number;
-  }>>([]);
+  const [killFeed,      setKillFeed]      = useState<
+    Array<{ killerId: string; killerName: string; victimId: string; victimName: string; ts: number }>
+  >([]);
+  const [scores, setScores] = useState<Record<string, number>>({});
 
   const patch = useCallback((partial: Partial<LobbyState>) => {
     if (!mounted.current) return;
     setState((prev) => ({ ...prev, ...partial }));
   }, []);
 
-  // ── Raw send ───────────────────────────────────────────────────────────────
   const send = useCallback((event: string, data: unknown = {}) => {
     const msg = JSON.stringify({ event, data });
     if (ws.current?.readyState === WebSocket.OPEN) {
@@ -124,217 +128,199 @@ export function LobbyProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
-  // ── Message dispatcher ─────────────────────────────────────────────────────
-  const handleMessage = useCallback((raw: string) => {
-    let parsed: { event: string; data: unknown };
-    try { parsed = JSON.parse(raw); } catch { return; }
-    const { event, data } = parsed;
+  const handleMessage = useCallback(
+    (raw: string) => {
+      let parsed: { event: string; data: unknown };
+      try { parsed = JSON.parse(raw); } catch { return; }
+      const { event, data } = parsed;
+      const d = data as any;
 
-    switch (event) {
+      switch (event) {
 
-      // ── Lobby ──────────────────────────────────────────────────────────────
+        // ── Lobby ──────────────────────────────────────────────────────────────
 
-      case S.CONNECTED:
-        playerIdRef.current = (data as any).playerId;
-        patch({
-          playerId:         (data as any).playerId,
-          playerName:       (data as any).name,
-          connectionStatus: "connected",
-          error:            null,
-        });
-        break;
+        case S.CONNECTED:
+          playerIdRef.current = d.playerId;
+          patch({
+            playerId:         d.playerId,
+            playerName:       d.name,
+            connectionStatus: "connected",
+            error:            null,
+          });
+          break;
 
-      case S.ROOM_LIST:
-        patch({ rooms: data as RoomListItem[] });
-        break;
+        case S.ROOM_LIST:
+          patch({ rooms: data as RoomListItem[] });
+          break;
 
-      case S.ROOM_JOINED:
-        patch({ currentRoom: data as RoomSnapshot, error: null });
-        router.push(`/game/${(data as RoomSnapshot).id}`);
-        break;
+        case S.ROOM_JOINED:
+          patch({ currentRoom: data as RoomSnapshot, error: null });
+          router.push(`/game/${(data as RoomSnapshot).id}`);
+          break;
 
-      case S.ROOM_LEFT:
-        patch({ currentRoom: null });
-        setRemotePlayers(new Map());
-        setLocalHp(100); setLocalIsDead(false);
-        setChatLog([]); setKillFeed([]);
-        router.push("/lobby");
-        break;
+        case S.ROOM_LEFT:
+          patch({ currentRoom: null });
+          setRemotePlayers(new Map());
+          setLocalHp(100); setLocalIsDead(false);
+          setChatLog([]); setKillFeed([]);
+          setScores({});
+          router.push("/lobby");
+          break;
 
-      case S.ROOM_UPDATED:
-        patch({ currentRoom: data as RoomSnapshot });
-        break;
+        // Server sends the snapshot directly as data (no .room wrapper).
+        case S.ROOM_UPDATED:
+          patch({ currentRoom: data as RoomSnapshot });
+          break;
 
-      case S.PLAYER_JOINED:
-        patch({ currentRoom: (data as any).room as RoomSnapshot });
-        break;
+        // These all send { ..., room: RoomSnapshot }.
+        case S.PLAYER_JOINED:
+        case S.PLAYER_LEFT:
+        case S.HOST_CHANGED:
+        case S.ARENA_SELECTED:
+          patch({ currentRoom: d.room as RoomSnapshot });
+          break;
 
-      case S.PLAYER_LEFT:
-        patch({ currentRoom: (data as any).room as RoomSnapshot });
-        setRemotePlayers((prev) => {
-          const next = new Map(prev);
-          next.delete((data as any).playerId);
-          return next;
-        });
-        break;
+        // game_started: { roomId, arenaId, room: RoomSnapshot }.
+        // The server broadcasts this to ALL players (host + non-host),
+        // so every client updates their room state and navigates to the game.
+        case S.GAME_STARTED:
+          patch({ currentRoom: d.room as RoomSnapshot, error: null });
+          router.push(`/game/${d.roomId}`);
+          break;
 
-      case S.HOST_CHANGED:
-        patch({ currentRoom: (data as any).room as RoomSnapshot });
-        break;
+        case S.ERROR:
+          patch({ error: d.message ?? "Unknown error" });
+          break;
 
-      case S.ARENA_SELECTED:
-        setState((prev) => {
-          if (!prev.currentRoom) return prev;
-          const room = (data as any).room as RoomSnapshot ?? {
-            ...prev.currentRoom,
-            arena: (data as any).arenaId,
-          };
-          return { ...prev, currentRoom: room };
-        });
-        break;
+        // ── Game: snapshot ────────────────────────────────────────────────────
 
-      case S.GAME_STARTED: {
-        const { roomId } = data as { roomId: string };
-        setState((prev) => {
-          if (!prev.currentRoom) return prev;
-          return { ...prev, currentRoom: { ...prev.currentRoom, status: "playing" } };
-        });
-        router.push(`/game/${roomId}`);
-        break;
-      }
+        case S.GAME_STATE_SNAPSHOT: {
+          const snap = data as GameSnapshot;
+          const myId = playerIdRef.current;
+          const map  = new Map<string, RemotePlayer>();
 
-      case S.ERROR:
-        patch({ error: (data as any).message ?? "Unknown error" });
-        break;
+          snap.players.forEach((p) => {
+            if (p.id === myId) {
+              setLocalHp(p.hp);
+              setLocalMaxHp(p.maxHp);
+              setLocalIsDead(p.isDead);
+            } else {
+              map.set(p.id, p);
+            }
+          });
 
-      // ── Game: full snapshot on join / reconnect ────────────────────────────
+          setRemotePlayers(map);
+          if (snap.scores) setScores(snap.scores);
+          break;
+        }
 
-      case S.GAME_STATE_SNAPSHOT: {
-        const snap = data as GameSnapshot;
-        const myId = playerIdRef.current;
-        const map  = new Map<string, RemotePlayer>();
-        snap.players.forEach((p) => {
-          if (p.id === myId) {
-            setLocalHp(p.hp);
-            setLocalMaxHp(p.maxHp);
-            setLocalIsDead(p.isDead);
+        case S.PLAYER_STATE: {
+          setRemotePlayers((prev) => {
+            const next     = new Map(prev);
+            const existing = next.get(d.playerId);
+            next.set(d.playerId, {
+              id:     d.playerId,
+              name:   existing?.name   ?? d.playerId,
+              pos:    d.pos,
+              rot:    d.rot,
+              hp:     existing?.hp     ?? 100,
+              maxHp:  existing?.maxHp  ?? 100,
+              isDead: existing?.isDead ?? false,
+              anim:   d.anim,
+            });
+            return next;
+          });
+          break;
+        }
+
+        case S.HEALTH_UPDATE: {
+          const myId = playerIdRef.current;
+          if (d.playerId === myId) {
+            setLocalHp(d.hp);
+            setLocalMaxHp(d.maxHp);
           } else {
-            map.set(p.id, p);
+            setRemotePlayers((prev) => {
+              const next = new Map(prev);
+              const p    = next.get(d.playerId);
+              if (p) next.set(d.playerId, { ...p, hp: d.hp, maxHp: d.maxHp });
+              return next;
+            });
           }
-        });
-        setRemotePlayers(map);
-        break;
-      }
-
-      // ── Game: movement relay ───────────────────────────────────────────────
-
-      case S.PLAYER_STATE: {
-        const d = data as any;
-        setRemotePlayers((prev) => {
-          const next = new Map(prev);
-          const existing = next.get(d.playerId);
-          next.set(d.playerId, {
-            id:      d.playerId,
-            name:    existing?.name ?? d.playerId,
-            pos:     d.pos,
-            rot:     d.rot,
-            hp:      existing?.hp     ?? 100,
-            maxHp:   existing?.maxHp  ?? 100,
-            isDead:  existing?.isDead ?? false,
-            anim:    d.anim,
-          });
-          return next;
-        });
-        break;
-      }
-
-      // ── Game: health ───────────────────────────────────────────────────────
-
-      case S.HEALTH_UPDATE: {
-        const d = data as any;
-        const myId = playerIdRef.current;
-        if (d.playerId === myId) {
-          setLocalHp(d.hp);
-          setLocalMaxHp(d.maxHp);
-        } else {
-          setRemotePlayers((prev) => {
-            const next = new Map(prev);
-            const p = next.get(d.playerId);
-            if (p) next.set(d.playerId, { ...p, hp: d.hp, maxHp: d.maxHp });
-            return next;
-          });
-        }
-        break;
-      }
-
-      // ── Game: death / respawn ──────────────────────────────────────────────
-
-      case S.PLAYER_DIED: {
-        const d = data as any;
-        const myId = playerIdRef.current;
-
-        if (d.playerId === myId) {
-          setLocalIsDead(true);
-          setLocalHp(0);
-        } else {
-          setRemotePlayers((prev) => {
-            const next = new Map(prev);
-            const p = next.get(d.playerId);
-            if (p) next.set(d.playerId, { ...p, hp: 0, isDead: true, anim: "dead" });
-            return next;
-          });
+          break;
         }
 
-        // Add to kill feed
-        setKillFeed((prev) => {
-          const killerName = prev.find((e) => e.killerId === d.killerId)?.killerName
-            ?? remotePlayers.get(d.killerId)?.name
-            ?? (d.killerId === myId ? state.playerName : d.killerId);
-          const victimName = remotePlayers.get(d.playerId)?.name
-            ?? (d.playerId === myId ? state.playerName : d.playerId);
-          return [
-            { killerId: d.killerId, killerName, victimId: d.playerId, victimName, ts: Date.now() },
-            ...prev.slice(0, 9),
-          ];
-        });
-        break;
-      }
+        case S.PLAYER_DIED: {
+          const myId = playerIdRef.current;
 
-      case S.PLAYER_RESPAWNED: {
-        const d = data as any;
-        const myId = playerIdRef.current;
-        if (d.playerId === myId) {
-          setLocalIsDead(false);
-        } else {
-          setRemotePlayers((prev) => {
-            const next = new Map(prev);
-            const p = next.get(d.playerId);
-            if (p) next.set(d.playerId, { ...p, pos: d.pos, isDead: false, anim: "idle" });
-            return next;
+          if (d.playerId === myId) {
+            setLocalIsDead(true);
+            setLocalHp(0);
+          } else {
+            setRemotePlayers((prev) => {
+              const next = new Map(prev);
+              const p    = next.get(d.playerId);
+              if (p) next.set(d.playerId, { ...p, hp: 0, isDead: true, anim: "dead" });
+              return next;
+            });
+          }
+
+          setKillFeed((prev) => {
+            const killerName =
+              prev.find((e) => e.killerId === d.killerId)?.killerName ??
+              remotePlayers.get(d.killerId)?.name ??
+              (d.killerId === myId ? state.playerName : d.killerId);
+            const victimName =
+              remotePlayers.get(d.playerId)?.name ??
+              (d.playerId === myId ? state.playerName : d.playerId);
+            return [
+              { killerId: d.killerId, killerName, victimId: d.playerId, victimName, ts: Date.now() },
+              ...prev.slice(0, 9),
+            ];
           });
+          break;
         }
-        break;
+
+        case S.PLAYER_RESPAWNED: {
+          const myId = playerIdRef.current;
+          if (d.playerId === myId) {
+            setLocalIsDead(false);
+          } else {
+            setRemotePlayers((prev) => {
+              const next = new Map(prev);
+              const p    = next.get(d.playerId);
+              if (p) next.set(d.playerId, { ...p, pos: d.pos, isDead: false, anim: "idle" });
+              return next;
+            });
+          }
+          break;
+        }
+
+        case S.CHAT_MESSAGE:
+          setChatLog((prev) => [...prev.slice(-99), data as ChatEntry]);
+          break;
+
+        case S.PLAYER_EMOTE:
+          window.dispatchEvent(new CustomEvent("game:emote", { detail: data }));
+          break;
+
+        case S.SCORE_UPDATE:
+          setScores(d.scores ?? {});
+          break;
       }
+    },
+    [patch, router, remotePlayers, state.playerName]
+  );
 
-      // ── Game: chat ─────────────────────────────────────────────────────────
+  // Always keep the ref current so connect() can call the latest handleMessage
+  // without listing it as a dependency (which caused the reconnect loop).
+  handleMessageRef.current = handleMessage;
 
-      case S.CHAT_MESSAGE:
-        setChatLog((prev) => [...prev.slice(-99), data as ChatEntry]);
-        break;
-
-      case S.PLAYER_EMOTE:
-        // Forward to 3D layer via a custom event — SplatViewer can listen
-        window.dispatchEvent(new CustomEvent("game:emote", { detail: data }));
-        break;
-    }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [patch, router]);
-
-  // ── WebSocket lifecycle ────────────────────────────────────────────────────
   const connect = useCallback(() => {
     if (!mounted.current) return;
-    if (ws.current?.readyState === WebSocket.OPEN ||
-        ws.current?.readyState === WebSocket.CONNECTING) return;
+    if (
+      ws.current?.readyState === WebSocket.OPEN ||
+      ws.current?.readyState === WebSocket.CONNECTING
+    ) return;
 
     patch({ connectionStatus: "connecting" });
 
@@ -348,7 +334,8 @@ export function LobbyProvider({ children }: { children: ReactNode }) {
       queue.current = [];
     };
 
-    socket.onmessage = (e) => handleMessage(e.data);
+    // Use the ref — connect() stays stable, no reconnect loop.
+    socket.onmessage = (e) => handleMessageRef.current(e.data);
 
     socket.onclose = () => {
       if (!mounted.current) return;
@@ -360,7 +347,7 @@ export function LobbyProvider({ children }: { children: ReactNode }) {
       patch({ connectionStatus: "error" });
       socket.close();
     };
-  }, [handleMessage, patch]);
+  }, [patch]); // patch is stable → connect() is stable → useEffect fires once
 
   useEffect(() => {
     mounted.current = true;
@@ -387,12 +374,12 @@ export function LobbyProvider({ children }: { children: ReactNode }) {
     seq: number; pos: Vec3; rot: Vec3; vel: Vec3; anim: string; t: number;
   }) => send(C.PLAYER_MOVE, payload), [send]);
 
-  const sendAttack = useCallback((targetId: string, damage: number, weaponId = "default") =>
+  const sendAttack     = useCallback((targetId: string, damage: number, weaponId = "default") =>
     send(C.PLAYER_ATTACK, { targetId, damage, weaponId }), [send]);
 
-  const sendEmote     = useCallback((emoteId: string) => send(C.PLAYER_EMOTE, { emoteId }), [send]);
-  const sendChat      = useCallback((text: string)    => send(C.CHAT_MESSAGE,  { text }),    [send]);
-  const requestRespawn = useCallback(()               => send(C.PLAYER_RESPAWN_REQUEST),     [send]);
+  const sendEmote      = useCallback((emoteId: string) => send(C.PLAYER_EMOTE,         { emoteId }), [send]);
+  const sendChat       = useCallback((text: string)    => send(C.CHAT_MESSAGE,          { text }),    [send]);
+  const requestRespawn = useCallback(()                => send(C.PLAYER_RESPAWN_REQUEST),             [send]);
 
   const isHost = state.currentRoom?.hostId === state.playerId;
 
@@ -405,6 +392,7 @@ export function LobbyProvider({ children }: { children: ReactNode }) {
     localIsDead,
     chatLog,
     killFeed,
+    scores,
     send,
     setName,
     refreshRooms,
